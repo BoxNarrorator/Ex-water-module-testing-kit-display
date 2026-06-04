@@ -1,0 +1,268 @@
+/*
+ * 04/20/2026 - Owned and Upkept by Sufyan-Taha
+ * ESP-32 DEVELOPMENT BOARD / ESP-IDF Water Monitor Prototype
+ * Features: Flow accumulation, Serial output, Wi-Fi AP, WebSocket Server, UDP Network Alert Broadcast
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/gpio.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "lwip/sockets.h"
+#include "esp_http_server.h"
+
+static const char *TAG = "WaterMonitor";
+
+// --- Configuration Defines ---
+#define FLOW_SENSOR_GPIO        GPIO_NUM_4
+#define ESP_INTR_FLAG_DEFAULT   0
+
+#define TDS_ADC_CHANNEL         ADC_CHANNEL_6  // GPIO 34
+#define NITRO_ADC_CHANNEL       ADC_CHANNEL_7  // GPIO 35
+
+#define FLOW_CALIBRATION_FACTOR 7.5   
+#define ADC_VREF_MV              3300  
+#define ADC_MAX_RESOLUTION      4095  
+
+// --- Wi-Fi & Network Configuration ---
+#define WIFI_SSID               "CleanWater_Monitor"
+#define WIFI_PASS               "CommunityWater123"
+#define WIFI_MAX_CONN           4
+#define UDP_BROADCAST_PORT      12345
+
+// --- Safety Thresholds ---
+#define THRESHOLD_TDS_PPM       1000.0   // Dangerous TDS level
+#define THRESHOLD_AMMONIA_MGL   3.0      // Dangerous Ammonia level
+
+// --- Global Variables ---
+volatile uint32_t pulse_count = 0;
+static adc_oneshot_unit_handle_t adc1_handle;
+static httpd_handle_t server = NULL;
+
+// --- Interrupt Service Routine (ISR) for Flow Sensor ---
+static void IRAM_ATTR flow_sensor_isr_handler(void* arg) {
+    pulse_count++;
+}
+
+// --- UDP Broadcast Function ---
+static void broadcast_emergency_alert(const char* message) {
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "Unable to create UDP socket");
+        return;
+    }
+
+    int broadcast_permission = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast_permission, sizeof(broadcast_permission));
+
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(UDP_BROADCAST_PORT);
+    dest_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST); // Broadcasts to 255.255.255.255
+
+    int err = sendto(sock, message, strlen(message), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    if (err < 0) {
+        ESP_LOGE(TAG, "Error occurred during UDP broadcast send");
+    } else {
+        ESP_LOGW(TAG, "EMERGENCY BROADCAST SENT: %s", message);
+    }
+
+    close(sock);
+}
+
+// --- WebSocket Handler ---
+static esp_err_t ws_handler(httpd_req_t *req) {
+    if (req->method == HTTP_GET) {
+        ESP_LOGI(TAG, "Handshake established with App/Client");
+        return ESP_OK;
+    }
+    return ESP_OK;
+}
+
+// Global broadcast to all connected WebSocket clients
+void websocket_broadcast_data(const char* json_str) {
+    if (server == NULL) return;
+    
+    size_t clients = WIFI_MAX_CONN;
+    int client_fds[WIFI_MAX_CONN] = {0};
+    
+    if (httpd_get_client_list(server, &clients, client_fds) == ESP_OK) {
+        for (size_t i = 0; i < clients; i++) {
+            if (httpd_ws_get_fd_info(server, client_fds[i]) == HTTPD_WS_CLIENT_WEBSOCKET) {
+                httpd_ws_frame_t ws_pkt;
+                memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+                ws_pkt.payload = (uint8_t*)json_str;
+                ws_pkt.len = strlen(json_str);
+                ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+                httpd_ws_send_frame_handle(server, client_fds[i], &ws_pkt);
+            }
+        }
+    }
+}
+
+// Setup HTTP/WebSocket Server Setup
+static httpd_handle_t start_webserver(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    
+    // URI mapping for websocket
+    static const httpd_uri_t ws = {
+        .uri        = "/ws",
+        .method     = HTTP_GET,
+        .handler    = ws_handler,
+        .user_ctx   = NULL,
+        .is_websocket = true
+    };
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_register_uri_handler(server, &ws);
+        return server;
+    }
+    return NULL;
+}
+
+// --- Wi-Fi SoftAP Event Handler ---
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+        ESP_LOGI(TAG, "App/Device joined network, MAC: "MACSTR, MAC2STR(event->mac));
+    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
+        ESP_LOGI(TAG, "App/Device left network, MAC: "MACSTR, MAC2STR(event->mac));
+    }
+}
+
+// --- Initialization Functions ---
+static void init_wifi_softap(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = WIFI_SSID,
+            .ssid_len = strlen(WIFI_SSID),
+            .password = WIFI_PASS,
+            .max_connection = WIFI_MAX_CONN,
+            .authmode = WIFI_AUTH_WPA2_PSK
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "Wi-Fi AP Ready. SSID: %s Pass: %s", WIFI_SSID, WIFI_PASS);
+}
+
+static void init_flow_sensor(void) {
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_POSEDGE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << FLOW_SENSOR_GPIO),
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_ENABLE 
+    };
+    gpio_config(&io_conf);
+
+    gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+    // Fixed typo from base code: gpio_isr_handler_add
+    gpio_isr_handler_add(FLOW_SENSOR_GPIO, flow_sensor_isr_handler, NULL);
+    ESP_LOGI(TAG, "Flow sensor ISR initialized on GPIO %d", FLOW_SENSOR_GPIO);
+}
+
+static void init_adc_sensors(void) {
+    adc_oneshot_unit_init_config_t init_config1 = {
+        .unit_id = ADC_UNIT_1,
+        .clk_src = ADC_DIGI_CLK_SRC_DEFAULT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+
+    adc_oneshot_chan_config_t config = {
+        .bitwidth = ADC_BITWIDTH_12,
+        .atten = ADC_ATTEN_DB_12,
+    };
+    
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, TDS_ADC_CHANNEL, &config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, NITRO_ADC_CHANNEL, &config));
+    ESP_LOGI(TAG, "ADC channels initialized successfully.");
+}
+
+float read_voltage_mv(adc_channel_t channel) {
+    int raw_adc_value = 0;
+    ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, channel, &raw_adc_value));
+    return ((float)raw_adc_value * ADC_VREF_MV) / ADC_MAX_RESOLUTION;
+}
+
+// --- Main Telemetry Task ---
+void water_monitor_task(void *pvParameters) {
+    uint32_t last_pulse_count = 0;
+    float total_liters = 0.0;
+    char json_buffer[256];
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        
+        uint32_t current_pulses = pulse_count;
+        uint32_t pulses_in_period = current_pulses - last_pulse_count;
+        last_pulse_count = current_pulses;
+
+        float flow_rate_lpm = ((float)pulses_in_period / 2.0) / FLOW_CALIBRATION_FACTOR;
+        total_liters += (flow_rate_lpm / 60.0) * 2.0;
+
+        float tds_voltage = read_voltage_mv(TDS_ADC_CHANNEL);
+        float nitro_voltage = read_voltage_mv(NITRO_ADC_CHANNEL);
+
+        float tds_ppm = (tds_voltage / 1000.0) * 500.0;        
+        float ammonia_mgL = (nitro_voltage / 1000.0) * 10.0;    
+
+        // 1. Serial JSON Push (for app serial data tracking)
+        snprintf(json_buffer, sizeof(json_buffer), 
+                 "{\"flow_lpm\":%.2f,\"total_L\":%.2f,\"tds_ppm\":%.1f,\"ammonia_mgL\":%.2f}", 
+                 flow_rate_lpm, total_liters, tds_ppm, ammonia_mgL);
+        
+        // This prints to standard Serial Monitor (UART)
+        printf("%s\n", json_buffer);
+
+        // 2. Push telemetry data out to connected App via WebSocket
+        websocket_broadcast_data(json_buffer);
+
+        // 3. Immediate Dangerous Threshold Check (Network-wide Push Alert)
+        if (tds_ppm >= THRESHOLD_TDS_PPM || ammonia_mgL >= THRESHOLD_AMMONIA_MGL) {
+            char alert_msg[128];
+            snprintf(alert_msg, sizeof(alert_msg), "CRITICAL ALERT: Dangerous Water Detected! TDS: %.1f PPM, NH3: %.2f mg/L", tds_ppm, ammonia_mgL);
+            broadcast_emergency_alert(alert_msg);
+        }
+    }
+}
+
+void app_main(void) {
+    ESP_LOGI(TAG, "Starting Secure Water Quality Monitor...");
+
+    // Initialize NVS (Needed for Wi-Fi configurations)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // Initialize Peripherals & Protocols
+    init_wifi_softap();
+    start_webserver();
+    init_flow_sensor();
+    init_adc_sensors();
+
+    xTaskCreate(water_monitor_task, "water_monitor_task", 4096, NULL, 5, NULL);
+}
