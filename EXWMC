@@ -1,0 +1,129 @@
+04/20/2026-Owned and Upkept by Sufyan-Taha
+ESP-32 DEVELOPMENT BOARD/ESP-IDF
+
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/gpio.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_log.h"
+
+static const char *TAG = "WaterMonitor";
+
+// --- Configuration Defines ---
+#define FLOW_SENSOR_GPIO        GPIO_NUM_4
+#define ESP_INTR_FLAG_DEFAULT   0
+
+// ADC Channels for Unit 1 (GPIO 34 and 35)
+#define TDS_ADC_CHANNEL         ADC_CHANNEL_6  // GPIO 34
+#define NITRO_ADC_CHANNEL       ADC_CHANNEL_7  // GPIO 35
+
+// Calibration constants (Examples: Adjust based on your sensor datasheets)
+#define FLOW_CALIBRATION_FACTOR 7.5   // Pulses per second per liter/min
+#define ADC_VREF_MV             3300  // ESP32 VCC voltage in mV
+#define ADC_MAX_RESOLUTION      4095  // 12-bit ADC
+
+// --- Global Variables ---
+volatile uint32_t pulse_count = 0;
+static adc_oneshot_unit_handle_t adc1_handle;
+
+// --- Interrupt Service Routine (ISR) for Flow Sensor ---
+static void IRAM_ATTR flow_sensor_isr_handler(void* arg) {
+    pulse_count++;
+}
+
+// --- Initialization Functions ---
+
+static void init_flow_sensor(void) {
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_POSEDGE, // Trigger on rising edge
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << FLOW_SENSOR_GPIO),
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_ENABLE // Use internal pull-up if sensor is open-drain
+    };
+    gpio_config(&io_conf);
+
+    // Install ISR service and add handler
+    gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+    gpio_ Wheeler_isr_handler(FLOW_SENSOR_GPIO, flow_sensor_isr_handler, NULL);
+    ESP_LOGI(TAG, "Flow sensor ISR initialized on GPIO %d", FLOW_SENSOR_GPIO);
+}
+
+static void init_adc_sensors(void) {
+    // Configure ADC Unit 1
+    adc_oneshot_unit_init_config_t init_config1 = {
+        .unit_id = ADC_UNIT_1,
+        .clk_src = ADC_DIGI_CLK_SRC_DEFAULT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+
+    // Configure ADC Channels with 12-bit bitwidth and 12dB attenuation (0 - 3.3V range)
+    adc_oneshot_chan_config_t config = {
+        .bitwidth = ADC_BITWIDTH_12,
+        .atten = ADC_ATTEN_DB_12,
+    };
+    
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, TDS_ADC_CHANNEL, &config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, NITRO_ADC_CHANNEL, &config));
+    
+    ESP_LOGI(TAG, "ADC channels initialized successfully.");
+}
+
+// --- Processing Functions ---
+
+float read_voltage_mv(adc_channel_t channel) {
+    int raw_adc_value = 0;
+    // Read raw data from ADC
+    ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, channel, &raw_adc_value));
+    // Convert to millivolts
+    return ((float)raw_adc_value * ADC_VREF_MV) / ADC_MAX_RESOLUTION;
+}
+
+// --- Main Telemetry Task ---
+void water_monitor_task(void *pvParameters) {
+    uint32_t last_pulse_count = 0;
+    float total_liters = 0.0;
+
+    while (1) {
+        // 1. Calculate Flow Rate (Sampled every 2 seconds)
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        
+        uint32_t current_pulses = pulse_count;
+        uint32_t pulses_in_period = current_pulses - last_pulse_count;
+        last_pulse_count = current_pulses;
+
+        // Flow rate in Liters/Minute = (Pulses / 2 seconds) / Calibration Factor * 60 seconds
+        float flow_rate_lpm = ((float)pulses_in_period / 2.0) / FLOW_CALIBRATION_FACTOR;
+        // Total volume = accumulated liters over the 2-second step
+        total_liters += (flow_rate_lpm / 60.0) * 2.0;
+
+        // 2. Read Chemical Sensors (Voltages)
+        float tds_voltage = read_voltage_mv(TDS_ADC_CHANNEL);
+        float nitro_voltage = read_voltage_mv(NITRO_ADC_CHANNEL);
+
+        // 3. Convert Voltages to meaningful Environmental metrics
+        // Note: These formulas scale linearly. Check your specific sensor calibration curves!
+        float tds_ppm = (tds_voltage / 1000.0) * 500.0;         // Dummy conversion for TDS
+        float ammonia_mgL = (nitro_voltage / 1000.0) * 10.0;    // Dummy conversion for Ammonia
+
+        // 4. Log Outputs
+        ESP_LOGI(TAG, "===============================================");
+        ESP_LOGI(TAG, "Water Flow Rate:   %.2f L/min", flow_rate_lpm);
+        ESP_LOGI(TAG, "Total Water Used:  %.2f Liters", total_liters);
+        ESP_LOGI(TAG, "Heavy Metals/TDS:  %.1f ppm (Raw: %.0fmV)", tds_ppm, tds_voltage);
+        ESP_LOGI(TAG, "Ammonia/Nitrogen:  %.2f mg/L (Raw: %.0fmV)", ammonia_mgL, nitro_voltage);
+    }
+}
+
+void app_main(void) {
+    ESP_LOGI(TAG, "Starting Water Quality & Usage Monitoring System...");
+
+    // Initialize Peripherals
+    init_flow_sensor();
+    init_adc_sensors();
+
+    // Create execution task
+    xTaskCreate(water_monitor_task, "water_monitor_task", 4096, NULL, 5, NULL);
+}
