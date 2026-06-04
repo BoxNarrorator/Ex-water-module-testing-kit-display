@@ -1,2 +1,2 @@
 # Ex-water-module-testing-kit-display
-A program I created for a water testing module that is for display
+A program created for a water testing module utilizing TDS and specialized electrode-based sensors to measure water parameters, and water usage
